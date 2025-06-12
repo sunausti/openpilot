@@ -2,12 +2,19 @@
 import os
 from openpilot.system.hardware import TICI
 USBGPU = "USBGPU" in os.environ
+OPENVINO = "OPENVINO" in os.environ
 if USBGPU:
   os.environ['AMD'] = '1'
   os.environ['AMD_IFACE'] = 'USB'
 elif TICI:
   from openpilot.selfdrive.modeld.runners.tinygrad_helpers import qcom_tensor_from_opencl_address
   os.environ['QCOM'] = '1'
+elif OPENVINO:
+  import openvino as ov
+  # onenvino device
+  ODEVICE="CPU"
+  os.environ['LLVM'] = '1'
+  os.environ['JIT'] = '2'
 else:
   os.environ['LLVM'] = '1'
   os.environ['JIT'] = '2'
@@ -45,6 +52,9 @@ VISION_PKL_PATH = Path(__file__).parent / 'models/driving_vision_tinygrad.pkl'
 POLICY_PKL_PATH = Path(__file__).parent / 'models/driving_policy_tinygrad.pkl'
 VISION_METADATA_PATH = Path(__file__).parent / 'models/driving_vision_metadata.pkl'
 POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.pkl'
+
+VISION_ONNX_PATH = Path(__file__).parent / 'models/driving_vision.onnx'
+POLICY_ONNX_PATH = Path(__file__).parent / 'models/driving_policy.onnx'
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.0
@@ -120,16 +130,21 @@ class ModelState:
 
     # img buffers are managed in openCL transform code
     self.vision_inputs: dict[str, Tensor] = {}
+    self.vision_inputs_numpy: dict[str, np.ndarray] = {}
     self.vision_output = np.zeros(vision_output_size, dtype=np.float32)
     self.policy_inputs = {k: Tensor(v, device='NPY').realize() for k,v in self.numpy_inputs.items()}
     self.policy_output = np.zeros(policy_output_size, dtype=np.float32)
     self.parser = Parser()
-
-    with open(VISION_PKL_PATH, "rb") as f:
-      self.vision_run = pickle.load(f)
-
-    with open(POLICY_PKL_PATH, "rb") as f:
-      self.policy_run = pickle.load(f)
+    if OPENVINO:
+        cloudlog.warning("using openvino: %s", ODEVICE)
+        core=ov.Core()
+        self.vision_run = core.compile_model(VISION_ONNX_PATH, ODEVICE)
+        self.policy_run = core.compile_model(POLICY_ONNX_PATH, ODEVICE)
+    else:
+        with open(VISION_PKL_PATH, "rb") as f:
+            self.vision_run = pickle.load(f)
+        with open(POLICY_PKL_PATH, "rb") as f:
+            self.policy_run = pickle.load(f)
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
@@ -163,15 +178,27 @@ class ModelState:
 
     if prepare_only:
       return None
-
-    self.vision_output = self.vision_run(**self.vision_inputs).numpy().flatten()
+    if OPENVINO:
+        for key in self.vision_inputs:
+            self.vision_inputs_numpy[key] = self.vision_inputs[key].numpy()
+        output = self.vision_run(self.vision_inputs_numpy)
+        output_name = self.vision_run.output(0).get_any_name()
+        output_numpy = np.array(output[output_name].data)
+        self.vision_output = output_numpy.astype(np.float32).flatten()
+    else:
+        self.vision_output = self.vision_run(**self.vision_inputs).numpy().flatten()
     vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(self.vision_output, self.vision_output_slices))
 
     self.full_features_buffer[0,:-1] = self.full_features_buffer[0,1:]
     self.full_features_buffer[0,-1] = vision_outputs_dict['hidden_state'][0, :]
     self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
-
-    self.policy_output = self.policy_run(**self.policy_inputs).numpy().flatten()
+    if OPENVINO:
+        output = self.policy_run(self.numpy_inputs)
+        output_name = self.policy_run.output(0).get_any_name()
+        output_numpy = np.array(output[output_name].data)
+        self.policy_output = output_numpy.astype(np.float32).flatten()
+    else:
+        self.policy_output = self.policy_run(**self.policy_inputs).numpy().flatten()
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_output, self.policy_output_slices))
 
     # TODO model only uses last value now
@@ -185,7 +212,11 @@ class ModelState:
 
     return combined_outputs_dict
 
-
+def convert_ndarray_to_list(d):
+    for key, value in d.items():
+        if isinstance(value, np.ndarray):
+            d[key] = value.tolist()
+    return d
 def main(demo=False):
   cloudlog.warning("modeld init")
 
