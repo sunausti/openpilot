@@ -6,6 +6,7 @@ export SIMULATION="1"
 export SKIP_FW_QUERY="1"
 export FINGERPRINT="HONDA_CIVIC_2022"
 export OPENVINO="1"
+export ODEVICE="NPU"
 #export CI="1"
 unset CI
 
