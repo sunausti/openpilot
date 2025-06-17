@@ -12,7 +12,10 @@ elif TICI:
 elif OPENVINO:
   import openvino as ov
   # onenvino device
-  ODEVICE="CPU"
+  if os.getenv('ODEVICE')=='NPU':
+    ODEVICE="NPU"
+  else:
+    ODEVICE="CPU"
   os.environ['LLVM'] = '1'
   os.environ['JIT'] = '2'
 else:
